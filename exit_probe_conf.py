@@ -6,7 +6,8 @@
 Outbound'ы с proxySettings (ходят через другой outbound) пропускаются — напрямую с моста
 они и не должны открываться.
 
-  exit-probe-conf --config /etc/bridge-guard/config.json --profile "RF-Bridge" --name RF-1 > conf.json
+  exit-probe-conf --name RF-1 --bridge 203.0.113.10 > conf.json        # профиль моста — из панели
+  exit-probe-conf --name RF-1 --profile "RF-Bridge" > conf.json         # или явно по имени профиля
 
 Токен бота попадает в вывод — печатать только в файл, не на экран.
 """
@@ -29,7 +30,8 @@ def api(base, token, path):
 def main():
     ap = argparse.ArgumentParser(description="конфиг exit-probe из профиля Remnawave")
     ap.add_argument("--config", default=os.environ.get("BRIDGE_GUARD_CONFIG", "/etc/bridge-guard/config.json"))
-    ap.add_argument("--profile", required=True, help="имя или uuid config-профиля мостов")
+    ap.add_argument("--profile", help="имя или uuid профиля (если не задан --bridge)")
+    ap.add_argument("--bridge", help="IP или имя моста — профиль возьмётся из панели")
     ap.add_argument("--name", required=True, help="как подписывать мост в сообщениях (например RF-1)")
     ap.add_argument("--timeout", type=float, default=5)
     ap.add_argument("--attempts", type=int, default=3)
@@ -44,9 +46,20 @@ def main():
         return 2
     profs = api(panel["url"], panel["token"], "/api/config-profiles")
     profs = profs.get("configProfiles", profs) if isinstance(profs, dict) else profs
-    prof = next((p for p in profs if a.profile in (p.get("uuid"), p.get("name"))), None)
+    prof = None
+    if a.bridge:
+        nodes = api(panel["url"], panel["token"], "/api/nodes")
+        nodes = nodes.get("nodes", nodes) if isinstance(nodes, dict) else nodes
+        node = next((n for n in nodes if a.bridge in (n.get("name"), n.get("address"))), None)
+        if not node:
+            print(f"мост «{a.bridge}» не найден в панели", file=sys.stderr)
+            return 2
+        pu = (node.get("configProfile") or {}).get("activeConfigProfileUuid")
+        prof = next((p for p in profs if p.get("uuid") == pu), None)
+    elif a.profile:
+        prof = next((p for p in profs if a.profile in (p.get("uuid"), p.get("name"))), None)
     if not prof:
-        print(f"профиль «{a.profile}» не найден; есть: {', '.join(p.get('name', '?') for p in profs)}", file=sys.stderr)
+        print(f"профиль не найден; есть: {', '.join(p.get('name', '?') for p in profs)}", file=sys.stderr)
         return 2
 
     exits = []

@@ -32,12 +32,13 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 COMMANDS = ("run", "setup", "doctor", "status", "rollback", "bridges")
 
 DEFAULT_THRESHOLDS = {"fail_n": 3, "ok_n": 3, "max_dead": 1}
 DEFAULT_PROBE = {
-    "port": 2053, "sni": "www.cloudflare.com", "fingerprint": "firefox", "flow": "xtls-rprx-vision",
+    "port": None, "security": "reality", "network": "tcp", "sni": "", "fingerprint": "chrome", "flow": "",
+    "public_key": "", "short_id": "", "path": "", "host": "", "service_name": "", "allow_insecure": False,
     "timeout": 12, "port_base": 3140, "urls": ["https://1.1.1.1/cdn-cgi/trace", "https://api.ipify.org"],
 }
 DEFAULT_PATHS = {"xray": "/opt/bridge-guard/xray", "state": "/var/lib/bridge-guard/state.json",
@@ -76,28 +77,49 @@ def read_config(path):
     return cfg
 
 
+def probe_problems(pr, where):
+    out = []
+    if not pr.get("port"):
+        out.append(f"{where}.port: не задан")
+    if pr.get("security") == "reality":
+        if not re.match(r"^[A-Za-z0-9_-]{43}$", str(pr.get("public_key") or "")):
+            out.append(f"{where}.public_key: не похож на публичный ключ Reality (43 символа base64url)")
+        if not re.match(r"^[0-9a-fA-F]{0,16}$", str(pr.get("short_id") or "")):
+            out.append(f"{where}.short_id: до 16 hex-символов")
+        if not pr.get("sni"):
+            out.append(f"{where}.sni: не задан")
+    if pr.get("security") not in ("reality", "tls", "none"):
+        out.append(f"{where}.security: reality | tls | none")
+    if pr.get("network") not in ("tcp", "raw", "ws", "grpc", "xhttp", "httpupgrade"):
+        out.append(f"{where}.network: tcp | ws | grpc | xhttp | httpupgrade")
+    return out
+
+
 def validate_config(cfg):
     """Список проблем (пустой = всё в порядке). Ловит и текст-заглушки из примера."""
     problems = []
     br = cfg.get("bridges")
     if br == "auto":
-        if not cfg["panel"].get("profile"):
-            problems.append("bridges: auto требует panel.profile (имя или uuid профиля мостов)")
+        auto = cfg.get("auto") or {}
+        if not (auto.get("countries") or auto.get("profiles") or cfg["panel"].get("profile")):
+            problems.append("bridges: auto требует auto.countries (например [\"RU\"]) или auto.profiles, или panel.profile")
     elif not br:
         problems.append("bridges: список мостов пуст (или укажите \"auto\")")
     else:
         for b in br:
             if not b.get("name") or not is_ip(b.get("ip", "")):
                 problems.append(f"bridges: у моста нужны name и ip: {b}")
-    checks = {
-        "uuid": (UUID_RE, "vlessUuid вида 8-4-4-4-12"),
-        "public_key": (r"^[A-Za-z0-9_-]{43}$", "публичный ключ Reality (43 символа base64url)"),
-        "short_id": (r"^[0-9a-fA-F]{0,16}$", "shortId — до 16 hex-символов"),
-    }
-    for key, (pattern, hint) in checks.items():
-        val = str(cfg["probe"].get(key) or "")
-        if not val or not re.match(pattern, val):
-            problems.append(f"probe.{key}: не задан или не похож на {hint} (bridge-guard setup заполнит сам)")
+    val = str(cfg["probe"].get("uuid") or "")
+    if not re.match(UUID_RE, val):
+        problems.append("probe.uuid: не задан или не похож на vlessUuid вида 8-4-4-4-12 (bridge-guard setup заполнит сам)")
+    has_panel = bool(cfg["panel"].get("url") and cfg["panel"].get("token"))
+    static_bridges = [b for b in (br if isinstance(br, list) else []) if not b.get("profile") and not b.get("probe")]
+    if not has_panel or static_bridges:
+        # без панели параметры клиента должны быть заданы руками (или у каждого моста свой probe)
+        problems += probe_problems(cfg["probe"], "probe")
+    for b in (br if isinstance(br, list) else []):
+        if b.get("probe"):
+            problems += probe_problems({**cfg["probe"], **b["probe"]}, f"bridges[{b.get('name')}].probe")
     fo = cfg["failover"]
     if not fo.get("dns") and not fo.get("hosts"):
         problems.append("failover: не задан ни dns, ни hosts — сторожу нечего переключать")
@@ -201,23 +223,115 @@ class Panel:
     def delete_user(self, uuid):
         return self.call("DELETE", "/api/users/" + uuid)
 
+    def set_user_squads(self, uuid, squad_uuids):
+        return self.call("PATCH", "/api/users", {"uuid": uuid, "activeInternalSquads": sorted(set(squad_uuids))})
+
+
+def inbound_client_params(prof, inbound, hosts, xray, defaults):
+    """Параметры клиента для инбаунда профиля — так же, как их собирает ссылка подписки:
+    транспорт и безопасность из профиля, sni/отпечаток/путь — из хоста подписки, если задан."""
+    raw = next((x for x in prof["config"].get("inbounds", []) if x.get("tag") == inbound.get("tag")), None)
+    if not raw or raw.get("protocol") != "vless":
+        return None
+    ss = raw.get("streamSettings") or {}
+    network = (ss.get("network") or "tcp").lower()
+    security = (ss.get("security") or "none").lower()
+    host = next((h for h in hosts if (h.get("inbound") or {}).get("configProfileInboundUuid") == inbound.get("uuid")
+                 and not h.get("isDisabled")), None) or {}
+    pr = {**defaults, "port": raw.get("port") or inbound.get("port"), "security": security, "network": network,
+          "fingerprint": host.get("fingerprint") or defaults.get("fingerprint") or "chrome"}
+    if security == "reality":
+        rs = ss.get("realitySettings") or {}
+        pr.update({"sni": host.get("sni") or (rs.get("serverNames") or [""])[0],
+                   "short_id": (rs.get("shortIds") or [""])[0],
+                   "public_key": xray_public_key(xray, rs.get("privateKey", "")) or ""})
+    elif security == "tls":
+        ts = ss.get("tlsSettings") or {}
+        pr["sni"] = host.get("sni") or ts.get("serverName") or ""
+        pr["allow_insecure"] = bool(defaults.get("allow_insecure"))
+    if network == "ws":
+        ws = ss.get("wsSettings") or {}
+        pr["path"], pr["host"] = host.get("path") or ws.get("path") or "/", host.get("host") or (ws.get("headers") or {}).get("Host") or ws.get("host") or ""
+    elif network == "grpc":
+        pr["service_name"] = (ss.get("grpcSettings") or {}).get("serviceName") or host.get("path") or ""
+    elif network == "xhttp":
+        xs = ss.get("xhttpSettings") or {}
+        pr["path"], pr["host"] = host.get("path") or xs.get("path") or "/", host.get("host") or xs.get("host") or ""
+    elif network == "httpupgrade":
+        hu = ss.get("httpupgradeSettings") or {}
+        pr["path"], pr["host"] = host.get("path") or hu.get("path") or "/", host.get("host") or hu.get("host") or ""
+    pr["flow"] = "xtls-rprx-vision" if (security in ("reality", "tls") and network in ("tcp", "raw")) else ""
+    pr["inbound_uuid"], pr["inbound_tag"] = inbound.get("uuid"), inbound.get("tag")
+    return pr
+
+
+def pick_inbound(prof, hosts, port=None):
+    """Инбаунд профиля: по порту, если задан и есть; иначе тот, на который смотрит больше хостов подписки."""
+    inbs = prof.get("inbounds") or []
+    if port:
+        hit = next((i for i in inbs if i.get("port") == port), None)
+        if hit:
+            return hit
+    def n_hosts(i):
+        return sum(1 for h in hosts if (h.get("inbound") or {}).get("configProfileInboundUuid") == i.get("uuid") and not h.get("isDisabled"))
+    inbs = sorted(inbs, key=lambda i: (-n_hosts(i), i.get("port") or 0))
+    return inbs[0] if inbs else None
+
 
 def bridges_of(cfg, panel=None):
-    """Список мостов: из конфига или (auto) — ноды профиля из панели."""
-    if cfg.get("bridges") != "auto":
-        return list(cfg["bridges"])
-    panel = panel or Panel(cfg["panel"]["url"], cfg["panel"]["token"])
-    prof = panel.profile(cfg["panel"]["profile"])
-    if not prof:
-        raise RuntimeError(f"профиль «{cfg['panel']['profile']}» не найден в панели")
-    addr = {n["uuid"]: n.get("address") for n in panel.nodes()}
+    """Список мостов с параметрами клиента для пробы.
+
+    bridges: "auto" — ноды из панели: по странам (auto.countries), по профилям (auto.profiles)
+             или все ноды профиля panel.profile; параметры клиента — из профиля каждой ноды.
+    bridges: [ {name, ip, profile?, probe?} ] — явный список; profile → параметры из панели,
+             probe → заданы руками, иначе — общий probe из конфига."""
+    br = cfg.get("bridges")
+    needs_panel = br == "auto" or any(b.get("profile") for b in (br if isinstance(br, list) else []))
+    if needs_panel and panel is None:
+        panel = Panel(cfg["panel"]["url"], cfg["panel"]["token"])
+    profs = {p["uuid"]: p for p in panel.profiles()} if needs_panel else {}
+    by_name = {p["name"]: p for p in profs.values()}
+    hosts = panel.hosts() if needs_panel else []
+    xray = cfg["paths"]["xray"]
+    cache = {}
+
+    def params_for(prof):
+        if prof["uuid"] not in cache:
+            ib = pick_inbound(prof, hosts, cfg["probe"].get("port"))
+            cache[prof["uuid"]] = inbound_client_params(prof, ib, hosts, xray, cfg["probe"]) if ib else None
+        return cache[prof["uuid"]]
+
     out = []
-    for n in prof.get("nodes") or []:
-        ip = addr.get(n["uuid"])
-        if ip and is_ip(ip):
-            out.append({"name": n["name"], "ip": ip})
+    if br == "auto":
+        auto = cfg.get("auto") or {}
+        countries = {c.upper() for c in (auto.get("countries") or [])}
+        want_profiles = set(auto.get("profiles") or ([cfg["panel"]["profile"]] if cfg["panel"].get("profile") and not countries else []))
+        for n in panel.nodes():
+            pu = (n.get("configProfile") or {}).get("activeConfigProfileUuid")
+            prof = profs.get(pu)
+            if not prof or not is_ip(n.get("address") or ""):
+                continue
+            ok = (countries and (n.get("countryCode") or "").upper() in countries) or                  (want_profiles and (prof["name"] in want_profiles or prof["uuid"] in want_profiles))
+            if not ok:
+                continue
+            pr = params_for(prof)
+            if pr:
+                out.append({"name": n["name"], "ip": n["address"], "profile": prof["name"], "probe": pr})
+    else:
+        for b in br:
+            pr = None
+            if b.get("profile"):
+                prof = by_name.get(b["profile"]) or profs.get(b["profile"])
+                if not prof:
+                    raise RuntimeError(f"профиль «{b['profile']}» моста {b.get('name')} не найден в панели")
+                pr = params_for(prof)
+            if b.get("probe"):
+                pr = {**(pr or cfg["probe"]), **b["probe"]}
+            out.append({"name": b["name"], "ip": b["ip"], "profile": b.get("profile"), "probe": pr or dict(cfg["probe"])})
     if not out:
-        raise RuntimeError("у профиля нет нод с IP-адресом — мосты не найдены")
+        raise RuntimeError("мосты не найдены — проверьте bridges / auto.countries / panel.profile")
+    for b in out:
+        b["probe"]["uuid"] = cfg["probe"]["uuid"]
     return out
 
 
@@ -305,19 +419,39 @@ def xray_public_key(xray, private_key):
     return m.group(1) if m else None
 
 
-def probe_bridge(cfg, ip, local_port):
-    """True, если через мост ip клиент реально выходит в интернет (получен внешний IPv4)."""
-    pr = cfg["probe"]
+def build_outbound(ip, pr, tag="out"):
+    """VLESS-outbound клиента под параметры моста: tcp/ws/grpc/xhttp/httpupgrade × reality/tls/none."""
+    user = {"id": pr["uuid"], "encryption": "none"}
+    if pr.get("flow"):
+        user["flow"] = pr["flow"]
+    network = pr.get("network") or "tcp"
+    ss = {"network": network, "security": pr.get("security") or "none"}
+    if ss["security"] == "reality":
+        ss["realitySettings"] = {"serverName": pr["sni"], "fingerprint": pr.get("fingerprint") or "chrome",
+                                 "publicKey": pr["public_key"], "shortId": pr.get("short_id") or ""}
+    elif ss["security"] == "tls":
+        ss["tlsSettings"] = {"serverName": pr.get("sni") or ip, "fingerprint": pr.get("fingerprint") or "chrome",
+                             "allowInsecure": bool(pr.get("allow_insecure"))}
+    if network == "ws":
+        ss["wsSettings"] = {"path": pr.get("path") or "/", **({"host": pr["host"]} if pr.get("host") else {})}
+    elif network == "grpc":
+        ss["grpcSettings"] = {"serviceName": pr.get("service_name") or ""}
+    elif network == "xhttp":
+        ss["xhttpSettings"] = {"path": pr.get("path") or "/", **({"host": pr["host"]} if pr.get("host") else {})}
+    elif network == "httpupgrade":
+        ss["httpupgradeSettings"] = {"path": pr.get("path") or "/", **({"host": pr["host"]} if pr.get("host") else {})}
+    return {"tag": tag, "protocol": "vless",
+            "settings": {"vnext": [{"address": ip, "port": pr["port"], "users": [user]}]},
+            "streamSettings": ss}
+
+
+def probe_bridge(cfg, bridge, local_port):
+    """True, если через мост клиент реально выходит в интернет (получен внешний IPv4)."""
+    pr = bridge["probe"]
     xcfg = {
         "log": {"loglevel": "none"},
         "inbounds": [{"tag": "in", "listen": "127.0.0.1", "port": local_port, "protocol": "http", "settings": {}}],
-        "outbounds": [{
-            "tag": "out", "protocol": "vless",
-            "settings": {"vnext": [{"address": ip, "port": pr["port"],
-                                    "users": [{"id": pr["uuid"], "encryption": "none", "flow": pr["flow"]}]}]},
-            "streamSettings": {"network": "tcp", "security": "reality",
-                               "realitySettings": {"serverName": pr["sni"], "fingerprint": pr["fingerprint"],
-                                                   "publicKey": pr["public_key"], "shortId": pr["short_id"]}}}],
+        "outbounds": [build_outbound(bridge["ip"], pr)],
     }
     tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
     json.dump(xcfg, tmp)
@@ -327,9 +461,9 @@ def probe_bridge(cfg, ip, local_port):
     try:
         time.sleep(1.5)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({"https": f"http://127.0.0.1:{local_port}"}))
-        for url in pr["urls"]:
+        for url in cfg["probe"]["urls"]:
             try:
-                body = opener.open(url, timeout=pr["timeout"]).read().decode(errors="replace")
+                body = opener.open(url, timeout=cfg["probe"]["timeout"]).read().decode(errors="replace")
                 if re.search(r"\b\d{1,3}(\.\d{1,3}){3}\b", body):
                     return True
             except Exception:  # noqa: BLE001
@@ -346,7 +480,7 @@ def probe_all(cfg, bridges, fake_dead=()):
         i, b = i_b
         if b["name"] in fake_dead:
             return b["name"], False
-        return b["name"], probe_bridge(cfg, b["ip"], cfg["probe"]["port_base"] + i)
+        return b["name"], probe_bridge(cfg, b, cfg["probe"]["port_base"] + i)
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(bridges)))) as ex:
         return dict(ex.map(one, enumerate(bridges)))
 
@@ -583,7 +717,9 @@ def cmd_status(cfg):
         bridges = [{"name": n, "ip": "?"} for n in state["bridges"]]
     for b in bridges:
         s = state["bridges"].get(b["name"], {"fails": 0, "oks": 0, "dead": False})
-        print(f"  {b['name']:<16} {b['ip']:<16} {'МЁРТВ' if s['dead'] else 'жив':<6} провалов подряд {s['fails']}, успехов {s['oks']}")
+        pr = b.get("probe") or {}
+        print(f"  {b['name']:<16} {b['ip']:<16} {'МЁРТВ' if s['dead'] else 'жив':<6} провалов подряд {s['fails']}, успехов {s['oks']}"
+              f"   :{pr.get('port')} {pr.get('security', '')}/{pr.get('network', '')}")
     sw = state.get("switched")
     print("  хосты:", f"переведены на {sw['to']} в {sw['at']} (исходных адресов: {len(sw.get('originals') or {})})" if sw else "на своих адресах")
     print("  заморозка:", "ДА — автодействия остановлены (bridge-guard doctor)" if state.get("frozen") else "нет")
@@ -666,10 +802,6 @@ def cmd_doctor(config_path, no_telegram=False):
         try:
             profs = panel.profiles()
             item(True, f"панель отвечает, токен принят ({cfg['panel']['url']}, профилей {len(profs)})")
-            if cfg["panel"].get("profile"):
-                prof = next((p for p in profs if cfg["panel"]["profile"] in (p.get("uuid"), p.get("name"))), None)
-                item(prof is not None, f"профиль мостов «{cfg['panel']['profile']}» найден",
-                     "проверьте panel.profile: " + ", ".join(p.get("name", "?") for p in profs))
         except Exception as e:  # noqa: BLE001
             item(False, "панель не отвечает или токен не принят", str(e)[:120])
             panel = None
@@ -678,7 +810,11 @@ def cmd_doctor(config_path, no_telegram=False):
 
     try:
         bridges = bridges_of(cfg, panel)
-        item(True, "мосты: " + ", ".join(f"{b['name']} {b['ip']}" for b in bridges))
+        item(True, f"мостов: {len(bridges)}")
+        for b in bridges:
+            pr = b["probe"]
+            print(f"       {b['name']:<18} {b['ip']:<16} :{pr.get('port')} {pr.get('security')}/{pr.get('network')}"
+                  f"{' ' + (pr.get('inbound_tag') or '')}{' профиль ' + b['profile'] if b.get('profile') else ''}")
     except Exception as e:  # noqa: BLE001
         item(False, "мосты не определены", str(e)[:120])
         bridges = []
@@ -694,16 +830,12 @@ def cmd_doctor(config_path, no_telegram=False):
                      "в конфиге старый uuid — bridge-guard setup обновит")
                 item(str(u.get("status", "")).upper() == "ACTIVE", f"служебный пользователь активен (статус {u.get('status')})",
                      "включите пользователя в панели или продлите срок")
-                if prof:
-                    inbound = next((i for i in prof.get("inbounds", []) if i.get("port") == cfg["probe"]["port"]), None)
-                    user_squads = {s["uuid"] for s in (u.get("activeInternalSquads") or [])}
-                    in_squad = False
-                    if inbound:
-                        for sq in panel.squads():
-                            if sq["uuid"] in user_squads and any(i["uuid"] == inbound["uuid"] for i in sq.get("inbounds", [])):
-                                in_squad = True
-                    item(in_squad, f"служебный пользователь состоит в сквадах инбаунда :{cfg['probe']['port']}",
-                         "добавьте пользователя в сквад этого инбаунда (или bridge-guard setup)")
+                user_squads = {sq["uuid"] for sq in (u.get("activeInternalSquads") or [])}
+                squads = panel.squads()
+                for ib_uuid, tag in sorted({(b["probe"].get("inbound_uuid"), b["probe"].get("inbound_tag")) for b in bridges if b["probe"].get("inbound_uuid")}):
+                    in_squad = any(sq["uuid"] in user_squads and any(i.get("uuid") == ib_uuid for i in sq.get("inbounds", [])) for sq in squads)
+                    item(in_squad, f"служебный пользователь состоит в сквадах инбаунда {tag}",
+                         "bridge-guard setup добавит его в нужный сквад")
         except Exception as e:  # noqa: BLE001
             item(False, "проверка служебного пользователя не удалась", str(e)[:120])
 
@@ -818,96 +950,132 @@ def cmd_setup(a):
     print(f"  ✅ панель отвечает, профилей {len(profs)}, нод {len(nodes)}")
     cfg["panel"].update({"url": url.rstrip("/"), "token": token})
 
-    # 2. профиль и мосты
-    print("\n── 2/6 Профиль мостов ──")
-    addr = {n["uuid"]: n.get("address") for n in nodes}
-    scored = []
-    for p in profs:
-        pn = p.get("nodes") or []
-        ru = sum(1 for n in pn if (n.get("countryCode") or "").upper() == "RU")
-        scored.append((ru, len(pn), p))
-    scored.sort(key=lambda x: (-x[0], -x[1]))
-    for i, (ru, n, p) in enumerate(scored, 1):
-        print(f"  {i:2}. {p['name']:<28} нод {n:<3} из них RU {ru}")
-    default_idx = 1 if scored else None
-    if a.profile:
-        prof = next((p for p in profs if a.profile in (p.get("uuid"), p.get("name"))), None)
-    else:
-        prof = None
-        while prof is None:
-            choice = ask("номер профиля, через который ходят клиенты (мосты)", str(default_idx) if default_idx else None, yes=yes)
-            if choice.isdigit() and 1 <= int(choice) <= len(scored):
-                prof = scored[int(choice) - 1][2]
-    if not prof:
-        print("  ❌ профиль не найден")
-        return 2
-    bridges = [{"name": n["name"], "ip": addr.get(n["uuid"])} for n in (prof.get("nodes") or []) if is_ip(addr.get(n["uuid"], ""))]
-    if not bridges:
-        print("  ❌ у профиля нет нод с IP — не из чего собрать мосты")
-        return 2
-    print("  мосты этого профиля: " + ", ".join(f"{b['name']} {b['ip']}" for b in bridges))
-    auto = ask_yes("брать мосты из панели автоматически (добавили ноду — сторож подхватит)", True, yes)
-    cfg["panel"]["profile"] = prof["name"]
-    cfg["bridges"] = "auto" if auto else bridges
-
-    # 3. инбаунд и ключи
-    print("\n── 3/6 Инбаунд и ключи Reality ──")
-    hosts = panel.hosts()
-    inbounds = []
-    for ib in prof.get("inbounds") or []:
-        raw = next((x for x in prof["config"].get("inbounds", []) if x.get("tag") == ib.get("tag")), {})
-        rs = (raw.get("streamSettings") or {}).get("realitySettings") or {}
-        if not rs:
+    # 2. мосты — ноды панели (обычно те, что в стране клиентов)
+    print("\n── 2/6 Мосты ──")
+    profs_by_uuid = {p["uuid"]: p for p in profs}
+    rows = []
+    for n in nodes:
+        pu = (n.get("configProfile") or {}).get("activeConfigProfileUuid")
+        prof = profs_by_uuid.get(pu)
+        if not prof or not is_ip(n.get("address") or ""):
             continue
-        n_hosts = sum(1 for h in hosts if (h.get("inbound") or {}).get("configProfileInboundUuid") == ib["uuid"] and not h.get("isDisabled"))
-        inbounds.append({"uuid": ib["uuid"], "tag": ib["tag"], "port": ib.get("port"), "hosts": n_hosts,
-                         "sni": (rs.get("serverNames") or ["www.cloudflare.com"])[0],
-                         "sid": (rs.get("shortIds") or [""])[0], "priv": rs.get("privateKey", "")})
-    if not inbounds:
-        print("  ❌ в профиле нет инбаундов с Reality")
+        rows.append({"name": n["name"], "ip": n["address"], "country": (n.get("countryCode") or "").upper(), "prof": prof})
+    if not rows:
+        print("  ❌ в панели нет нод с IP-адресом и профилем")
         return 2
-    inbounds.sort(key=lambda x: (-x["hosts"], x["port"] or 0))
-    for i, ib in enumerate(inbounds, 1):
-        print(f"  {i:2}. :{ib['port']:<6} {ib['tag']:<24} хостов подписки {ib['hosts']}")
-    pick = inbounds[0]
-    if a.port:
-        pick = next((ib for ib in inbounds if ib["port"] == a.port), None) or pick
+    if a.profile:
+        rows = [r for r in rows if a.profile in (r["prof"]["name"], r["prof"]["uuid"])] or rows
+    countries = {c.strip().upper() for c in (a.countries or "").split(",") if c.strip()}
+    if a.bridges:
+        wanted = {x.strip() for x in a.bridges.split(",") if x.strip()}
+        default_idx = [i for i, r in enumerate(rows, 1) if r["name"] in wanted]
+    elif countries:
+        default_idx = [i for i, r in enumerate(rows, 1) if r["country"] in countries]
     else:
-        choice = ask("номер инбаунда, которым пользуется большинство клиентов", "1", yes=yes)
-        if choice.isdigit() and 1 <= int(choice) <= len(inbounds):
-            pick = inbounds[int(choice) - 1]
-    pbk = xray_public_key(xray, pick["priv"])
-    if not pbk:
-        print("  ❌ не удалось посчитать публичный ключ из приватного (xray x25519)")
+        ru = [i for i, r in enumerate(rows, 1) if r["country"] == "RU"]
+        default_idx = ru or list(range(1, len(rows) + 1))
+    for i, r in enumerate(rows, 1):
+        print(f"  {i:2}. {'*' if i in default_idx else ' '} {r['name']:<20} {r['ip']:<16} {r['country'] or '--':<4} профиль {r['prof']['name']}")
+    print("  (* — предложены по умолчанию; входы платных продуктов и обычные ноды из списка уберите)")
+    choice = ask("номера мостов через запятую (те, через которые ходят клиенты)", ",".join(map(str, default_idx)), yes=yes)
+    idx = sorted({int(x) for x in re.findall(r"\d+", choice) if 1 <= int(x) <= len(rows)})
+    chosen = [rows[i - 1] for i in idx]
+    if not chosen:
+        print("  ❌ мосты не выбраны")
         return 2
-    cfg["probe"].update({"port": pick["port"], "sni": pick["sni"], "short_id": pick["sid"], "public_key": pbk})
-    print(f"  ✅ инбаунд :{pick['port']} {pick['tag']}: sni {pick['sni']}, shortId {pick['sid'] or '(пусто)'}, ключ посчитан")
+    # как запомнить выбор: «все ноды этих профилей» (точнее всего — мосты обычно делят один профиль),
+    # иначе «все ноды этих стран», иначе явный список
+    sel_profiles = {r["prof"]["name"] for r in chosen}
+    sel_countries = {r["country"] for r in chosen if r["country"]}
+    cfg["panel"].pop("profile", None)
+    if len([r for r in rows if r["prof"]["name"] in sel_profiles]) == len(chosen):
+        cfg["bridges"], cfg["auto"] = "auto", {"profiles": sorted(sel_profiles)}
+        print(f"  мосты: все ноды профилей {', '.join(sorted(sel_profiles))} — новые ноды на этих профилях подхватятся сами")
+    elif sel_countries and len([r for r in rows if r["country"] in sel_countries]) == len(chosen):
+        cfg["bridges"], cfg["auto"] = "auto", {"countries": sorted(sel_countries)}
+        print(f"  мосты: все ноды со страной {', '.join(sorted(sel_countries))} — новые подхватятся сами")
+    else:
+        cfg["bridges"] = [{"name": r["name"], "ip": r["ip"], "profile": r["prof"]["name"]} for r in chosen]
+        cfg.pop("auto", None)
+        print("  мосты: явный список — новые ноды в панели сторож НЕ подхватит, добавьте их в конфиг")
+    bridges = [{"name": r["name"], "ip": r["ip"]} for r in chosen]
 
-    # 4. служебный пользователь
+    # 3. инбаунд и параметры клиента — из профиля КАЖДОГО моста
+    print("\n── 3/6 Инбаунд и параметры клиента ──")
+    hosts = panel.hosts()
+    def n_hosts(ib):
+        return sum(1 for h in hosts if (h.get("inbound") or {}).get("configProfileInboundUuid") == ib.get("uuid") and not h.get("isDisabled"))
+    ports = {}
+    for r in chosen:
+        for ib in r["prof"].get("inbounds") or []:
+            raw = next((x for x in r["prof"]["config"].get("inbounds", []) if x.get("tag") == ib.get("tag")), {})
+            if raw.get("protocol") != "vless":
+                continue
+            ports.setdefault(ib.get("port"), {"hosts": 0, "tags": set()})
+            ports[ib.get("port")]["hosts"] += n_hosts(ib)
+            ports[ib.get("port")]["tags"].add(f"{r['prof']['name']}:{ib['tag']}")
+    if not ports:
+        print("  ❌ у выбранных мостов нет VLESS-инбаундов")
+        return 2
+    order = sorted(ports, key=lambda p: (-ports[p]["hosts"], p or 0))
+    for i, port in enumerate(order, 1):
+        print(f"  {i:2}. :{port:<6} хостов подписки {ports[port]['hosts']:<3} {', '.join(sorted(ports[port]['tags']))[:70]}")
+    port = a.port or None
+    if not port:
+        choice = ask("номер порта, которым пользуется большинство клиентов", "1", yes=yes)
+        port = order[int(choice) - 1] if choice.isdigit() and 1 <= int(choice) <= len(order) else order[0]
+    cfg["probe"]["port"] = port
+    derived = {}
+    need_inbounds = {}
+    for r in chosen:
+        ib = pick_inbound(r["prof"], hosts, port)
+        pr = inbound_client_params(r["prof"], ib, hosts, xray, cfg["probe"]) if ib else None
+        if not pr:
+            print(f"  ❌ {r['name']}: не удалось собрать параметры клиента из профиля {r['prof']['name']}")
+            return 2
+        if pr["security"] == "reality" and not pr.get("public_key"):
+            print(f"  ❌ {r['name']}: не удалось посчитать публичный ключ Reality (xray x25519)")
+            return 2
+        derived[r["name"]] = pr
+        need_inbounds[pr["inbound_uuid"]] = (r["prof"]["name"], pr["inbound_tag"])
+        print(f"  ✅ {r['name']:<20} :{pr['port']} {pr['inbound_tag']:<22} {pr['security']}/{pr['network']}"
+              f"{' sni ' + pr['sni'] if pr.get('sni') else ''}{' flow' if pr.get('flow') else ''}")
+    for b in bridges:
+        b["probe"] = derived[b["name"]]
+
+    # 4. служебный пользователь — в сквадах ВСЕХ нужных инбаундов
     print("\n── 4/6 Служебный пользователь ──")
     username = a.probe_user or ask("имя служебного пользователя", cfg["probe"].get("username") or "bridge-probe", yes=yes)
     squads = panel.squads()
-    fitting = [s for s in squads if any(i.get("uuid") == pick["uuid"] for i in s.get("inbounds", []))]
-    if not fitting:
-        print(f"  ❌ ни один сквад не содержит инбаунд :{pick['port']} — клиенты через него не ходят?")
-        return 2
-    fitting.sort(key=lambda s: -((s.get("info") or {}).get("membersCount") or 0))
-    squad = fitting[0]
-    print(f"  сквад инбаунда: {squad['name']} (участников {(squad.get('info') or {}).get('membersCount', '?')})")
+    need_squads = {}
+    for ib_uuid, (pname, tag) in need_inbounds.items():
+        fitting = [sq for sq in squads if any(i.get("uuid") == ib_uuid for i in sq.get("inbounds", []))]
+        if not fitting:
+            print(f"  ❌ ни один сквад не содержит инбаунд {pname}:{tag} — клиенты через него не ходят?")
+            return 2
+        fitting.sort(key=lambda sq: -((sq.get("info") or {}).get("membersCount") or 0))
+        need_squads[fitting[0]["uuid"]] = fitting[0]["name"]
+    print("  сквады для пробы: " + ", ".join(need_squads.values()))
     user = panel.user_by_name(username)
     if user:
-        in_squad = squad["uuid"] in {s["uuid"] for s in (user.get("activeInternalSquads") or [])}
-        print(f"  пользователь {username} уже есть{'' if in_squad else ' — но НЕ в этом сквадe'}")
-        if not in_squad:
-            print("  ❌ добавьте его в сквад в панели или выберите другое имя (--probe-user)")
-            return 2
+        have = {sq["uuid"] for sq in (user.get("activeInternalSquads") or [])}
+        missing = [name for u, name in need_squads.items() if u not in have]
+        print(f"  пользователь {username} уже есть" + (f", не хватает сквадов: {', '.join(missing)}" if missing else ""))
+        if missing:
+            if a.no_user_create or not ask_yes("добавить его в недостающие сквады", True, yes):
+                print("  ❌ без сквадов пробы через часть мостов невозможны")
+                return 2
+            panel.set_user_squads(user["uuid"], list(have | set(need_squads)))
+            print("  ✅ сквады обновлены")
     else:
-        if a.no_user_create or not ask_yes(f"создать пользователя {username} в сквадe {squad['name']} (срок 10 лет, без лимита)", True, yes):
+        if a.no_user_create or not ask_yes(f"создать пользователя {username} в сквадах {', '.join(need_squads.values())} (срок 10 лет, без лимита)", True, yes):
             print("  ❌ без служебного пользователя пробы невозможны")
             return 2
-        user = panel.create_user(username, [squad["uuid"]], "bridge-guard: служебный пользователь для проверки мостов")
+        user = panel.create_user(username, list(need_squads), "bridge-guard: служебный пользователь для проверки мостов")
         print(f"  ✅ создан {username}")
     cfg["probe"].update({"uuid": user["vlessUuid"], "username": username})
+    for b in bridges:
+        b["probe"]["uuid"] = user["vlessUuid"]
 
     # 5. переключение: DNS-пул и хосты
     print("\n── 5/6 Куда переключать ──")
@@ -980,7 +1148,7 @@ def cmd_setup(a):
     # проверка и репетиция
     print("\n── Проверка по-настоящему ──")
     cfg = load_config(a.config)
-    results = probe_all(cfg, bridges)
+    results = probe_all(cfg, bridges_of(cfg, panel))
     for b in bridges:
         print(f"  {'✅' if results[b['name']] else '❌'} {b['name']} {b['ip']}")
     if not any(results.values()):
@@ -1015,8 +1183,10 @@ def main():
     s = sub.add_parser("setup", help="мастер настройки", parents=[common])
     s.add_argument("--panel-url")
     s.add_argument("--token")
-    s.add_argument("--profile")
-    s.add_argument("--port", type=int)
+    s.add_argument("--profile", help="ограничить выбор мостов одним профилем")
+    s.add_argument("--countries", help="мосты = ноды с этими странами, через запятую (например RU)")
+    s.add_argument("--bridges", help="имена мостов через запятую")
+    s.add_argument("--port", type=int, help="порт инбаунда, которым пользуются клиенты")
     s.add_argument("--probe-user")
     s.add_argument("--no-user-create", action="store_true")
     s.add_argument("--dns-name")
@@ -1051,7 +1221,7 @@ def main():
         return cmd_rollback(cfg, a.dry_run, a.yes)
     if a.cmd == "bridges":
         for b in bridges_of(cfg):
-            print(b["name"], b["ip"])
+            print(b["name"], b["ip"], b.get("profile") or "-")
         return 0
     fake = {x.strip() for x in a.fake_dead.split(",") if x.strip()}
     if a.dry_run:

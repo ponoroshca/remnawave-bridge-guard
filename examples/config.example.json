@@ -1,24 +1,24 @@
 {
   "panel": {
     "url": "https://panel.example.com",
-    "token": "REMNAWAVE_API_TOKEN",
-    "profile": "RF-Bridge"
+    "token": "REMNAWAVE_API_TOKEN"
   },
   "bridges": "auto",
+  "auto": {
+    "profiles": [
+      "RF-Bridge"
+    ],
+    "countries": []
+  },
   "probe": {
     "port": 2053,
-    "uuid": "vlessUuid служебного пользователя (docs/panel-setup.md)",
-    "public_key": "публичный ключ Reality инбаунда мостов",
-    "short_id": "shortId инбаунда мостов",
-    "sni": "www.cloudflare.com",
-    "fingerprint": "firefox",
-    "flow": "xtls-rprx-vision",
+    "uuid": "vlessUuid служебного пользователя — заполнит bridge-guard setup",
+    "username": "bridge-probe",
     "timeout": 12,
     "urls": [
       "https://1.1.1.1/cdn-cgi/trace",
       "https://api.ipify.org"
-    ],
-    "username": "bridge-probe"
+    ]
   },
   "thresholds": {
     "fail_n": 3,
@@ -47,14 +47,14 @@
     "chat_id": 123456789,
     "proxy": ""
   },
-  "paths": {
-    "xray": "/opt/bridge-guard/xray",
-    "state": "/var/lib/bridge-guard/state.json",
-    "backups": "/var/lib/bridge-guard/backups"
-  },
   "heartbeat": {
     "url": "",
     "daily_summary": true,
     "summary_hour": 9
+  },
+  "paths": {
+    "xray": "/opt/bridge-guard/xray",
+    "state": "/var/lib/bridge-guard/state.json",
+    "backups": "/var/lib/bridge-guard/backups"
   }
 }
