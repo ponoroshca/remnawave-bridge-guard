@@ -19,8 +19,8 @@ jobs:
       - name: empty and unfilled configs are rejected (exit 2)
         run: |
           echo '{}' > /tmp/empty.json
-          python3 bridge_guard.py --config /tmp/empty.json status; [ $? -eq 2 ] || { echo "пустой конфиг должен давать exit 2"; exit 1; }
-          python3 bridge_guard.py --config examples/config.example.json status; [ $? -eq 2 ] || { echo "пример с заглушками должен давать exit 2"; exit 1; }
+          rc=0; python3 bridge_guard.py --config /tmp/empty.json status || rc=$?; [ "$rc" -eq 2 ] || { echo "пустой конфиг должен давать exit 2, а дал $rc"; exit 1; }
+          rc=0; python3 bridge_guard.py --config examples/config.example.json status || rc=$?; [ "$rc" -eq 2 ] || { echo "пример с заглушками должен давать exit 2, а дал $rc"; exit 1; }
       - name: versions match the changelog
         run: |
           v=$(grep -m1 -oE '^## [0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md | cut -c4-)
@@ -28,4 +28,4 @@ jobs:
           [ "$(python3 bridge_guard.py --version)" = "$v" ]
       - name: doctor without config exits 1 with a hint
         run: |
-          python3 bridge_guard.py --config /tmp/none.json doctor | grep -q "bridge-guard setup"; [ ${PIPESTATUS[0]} -eq 1 ]
+          rc=0; out=$(python3 bridge_guard.py --config /tmp/none.json doctor) || rc=$?; echo "$out" | grep -q "bridge-guard setup" && [ "$rc" -eq 1 ]
