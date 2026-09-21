@@ -1,0 +1,17 @@
+{
+  "name": "RF-1",
+  "telegram": { "bot_token": "123456:TELEGRAM_BOT_TOKEN", "chat_id": 123456789, "proxy": "" },
+  "exits": [
+    ["to-fi", "198.51.100.10", 2053],
+    ["to-nl", "198.51.100.20", 2053],
+    ["to-us", "198.51.100.30", 2053]
+  ],
+  "controls": [
+    ["Cloudflare", "104.16.123.96", 443],
+    ["ya.ru", "77.88.55.242", 443]
+  ],
+  "timeout": 5,
+  "attempts": 3,
+  "repeat_hours": 6,
+  "state_file": "/var/lib/exit-probe/state.json"
+}

@@ -1,0 +1,10 @@
+[Unit]
+Description=bridge-guard: сторож мостов Remnawave (проверка настоящим клиентом)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/bridge-guard/bridge_guard.py --config /etc/bridge-guard/config.json
+# 1 = есть мёртвые мосты (это штатно, не сбой сервиса)
+SuccessExitStatus=0 1

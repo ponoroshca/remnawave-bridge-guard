@@ -1,0 +1,9 @@
+[Unit]
+Description=exit-probe: достижимость exit-нод с моста (TCP, не ping)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/exit-probe/exit_probe.py --config /etc/exit-probe/config.json
+SuccessExitStatus=0 1

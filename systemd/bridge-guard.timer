@@ -1,0 +1,10 @@
+[Unit]
+Description=bridge-guard — проверка мостов раз в минуту
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=60
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

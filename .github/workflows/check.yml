@@ -1,0 +1,20 @@
+name: check
+on: [push, pull_request]
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: python syntax
+        run: python3 -m py_compile bridge_guard.py exit_probe.py exit_probe_conf.py lanes_probe.py
+      - name: shell syntax
+        run: bash -n scripts/install.sh scripts/install-exit-probe.sh
+      - name: examples are valid JSON
+        run: python3 -c "import json; json.load(open('examples/config.example.json')); json.load(open('examples/exit-probe.example.json'))"
+      - name: config validation catches an empty config
+        run: |
+          echo '{}' > /tmp/empty.json
+          if python3 bridge_guard.py --config /tmp/empty.json --status; then echo "должен был отказаться"; exit 1; fi

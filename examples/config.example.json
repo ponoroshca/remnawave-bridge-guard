@@ -1,0 +1,49 @@
+{
+  "panel": {
+    "url": "https://panel.example.com",
+    "token": "REMNAWAVE_API_TOKEN"
+  },
+  "bridges": [
+    { "name": "RF-1", "ip": "203.0.113.10" },
+    { "name": "RF-2", "ip": "203.0.113.20" }
+  ],
+  "probe": {
+    "port": 2053,
+    "uuid": "vlessUuid служебного пользователя (docs/panel-setup.md)",
+    "public_key": "публичный ключ Reality инбаунда мостов",
+    "short_id": "shortId инбаунда мостов",
+    "sni": "www.cloudflare.com",
+    "fingerprint": "firefox",
+    "flow": "xtls-rprx-vision",
+    "timeout": 12,
+    "urls": ["https://1.1.1.1/cdn-cgi/trace", "https://api.ipify.org"]
+  },
+  "thresholds": {
+    "fail_n": 3,
+    "ok_n": 3,
+    "max_dead": 1
+  },
+  "failover": {
+    "dns": {
+      "provider": "cloudflare",
+      "token_file": "/etc/bridge-guard/cloudflare.token",
+      "zone": "example.com",
+      "name": "bridge.example.com",
+      "ttl": 60,
+      "min_pool": 1
+    },
+    "hosts": {
+      "match_address": "bridge.example.com"
+    }
+  },
+  "telegram": {
+    "bot_token": "123456:TELEGRAM_BOT_TOKEN",
+    "chat_id": 123456789,
+    "proxy": ""
+  },
+  "paths": {
+    "xray": "/opt/bridge-guard/xray",
+    "state": "/var/lib/bridge-guard/state.json",
+    "backups": "/var/lib/bridge-guard/backups"
+  }
+}

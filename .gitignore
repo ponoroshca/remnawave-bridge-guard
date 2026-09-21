@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.token
+config.json
+state.json
+/backups/
+.DS_Store
