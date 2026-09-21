@@ -21,7 +21,25 @@
 Outbound'ы с `proxySettings` (ходят через другой outbound) в список не попадают —
 напрямую с моста они и не должны открываться.
 
-**После смены адреса любой ноды** запустите установку заново — список статичный.
+**После смены адреса любой ноды** пересоберите зонды на всех мостах:
+
+```bash
+refresh-exit-probes ~/.ssh/id_ed25519
+```
+
+Можно повесить на таймер раз в сутки (ssh-ключ без пароля на мосты):
+
+```ini
+# /etc/systemd/system/refresh-exit-probes.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/refresh-exit-probes /root/.ssh/id_ed25519
+# /etc/systemd/system/refresh-exit-probes.timer
+[Timer]
+OnCalendar=daily
+[Install]
+WantedBy=timers.target
+```
 
 ## Что означают сообщения
 

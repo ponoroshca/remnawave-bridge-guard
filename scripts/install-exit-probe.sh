@@ -8,15 +8,18 @@
 # systemd-юниты на мост по ssh (root), включает таймер и делает пробный прогон в консоль.
 # Перезапускать после смены адреса любой ноды — список exit-ов в конфиге статичный.
 set -euo pipefail
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
+# работает и из клона (scripts/), и из /opt/bridge-guard (после install.sh)
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+[ -f "$HERE/exit_probe.py" ] || HERE="$(cd "$HERE/.." && pwd)"
 IP="${1:?ip моста}"; PROFILE="${2:?имя профиля мостов}"; NAME="${3:?имя моста}"; KEY="${4:-}"
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=15"; SCP="scp -q -o BatchMode=yes -o ConnectTimeout=15"
 [ -n "$KEY" ] && { SSH="$SSH -i $KEY"; SCP="$SCP -i $KEY"; }
-GEN="$HERE/exit_probe_conf.py"; [ -f "$GEN" ] || GEN=/opt/bridge-guard/exit_probe_conf.py
+GEN="$HERE/exit_probe_conf.py"
+CONFIG="${BRIDGE_GUARD_CONFIG:-/etc/bridge-guard/config.json}"
 
 tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
 umask 077
-python3 "$GEN" --profile "$PROFILE" --name "$NAME" > "$tmp"
+python3 "$GEN" --config "$CONFIG" --profile "$PROFILE" --name "$NAME" > "$tmp"
 echo "конфиг собран: $(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print(len(c['exits']), 'exit-ов,', len(c['controls']), 'контроля')" "$tmp")"
 
 $SSH "root@$IP" 'mkdir -p /opt/exit-probe /etc/exit-probe /var/lib/exit-probe'

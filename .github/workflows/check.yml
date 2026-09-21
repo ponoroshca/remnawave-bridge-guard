@@ -11,7 +11,9 @@ jobs:
       - name: python syntax
         run: python3 -m py_compile bridge_guard.py exit_probe.py exit_probe_conf.py lanes_probe.py
       - name: shell syntax
-        run: bash -n scripts/install.sh scripts/install-exit-probe.sh
+        run: bash -n scripts/*.sh
+      - name: CLI help
+        run: for c in "" run setup doctor status rollback; do python3 bridge_guard.py $c --help >/dev/null; done
       - name: examples are valid JSON
         run: python3 -c "import json; json.load(open('examples/config.example.json')); json.load(open('examples/exit-probe.example.json'))"
       - name: config validation catches an empty config

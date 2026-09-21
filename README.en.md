@@ -27,11 +27,9 @@ Python 3.9+ standard library only + the Xray-core binary. Ubuntu 22.04/24.04, De
 Remnawave 2.x API. DNS: Cloudflare (other providers are a 30-line class).
 
 ```bash
-git clone https://github.com/ponoroshca/remnawave-bridge-guard.git && cd remnawave-bridge-guard
-sudo ./scripts/install.sh
-sudo nano /etc/bridge-guard/config.json      # see docs/panel-setup.md
-bridge-guard --dry-run
-sudo systemctl enable --now bridge-guard.timer
+curl -fsSL https://raw.githubusercontent.com/ponoroshca/remnawave-bridge-guard/main/scripts/install.sh | sudo bash
+sudo bridge-guard setup      # wizard: finds bridges & keys in the panel, creates the probe user, checks DNS & Telegram
+bridge-guard doctor          # checklist with hints when something is off
 ```
 
 Messages and docs are in Russian — the tool was born from running services for a

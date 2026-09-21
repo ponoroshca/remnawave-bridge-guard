@@ -1,12 +1,10 @@
 {
   "panel": {
     "url": "https://panel.example.com",
-    "token": "REMNAWAVE_API_TOKEN"
+    "token": "REMNAWAVE_API_TOKEN",
+    "profile": "RF-Bridge"
   },
-  "bridges": [
-    { "name": "RF-1", "ip": "203.0.113.10" },
-    { "name": "RF-2", "ip": "203.0.113.20" }
-  ],
+  "bridges": "auto",
   "probe": {
     "port": 2053,
     "uuid": "vlessUuid служебного пользователя (docs/panel-setup.md)",
@@ -16,7 +14,11 @@
     "fingerprint": "firefox",
     "flow": "xtls-rprx-vision",
     "timeout": 12,
-    "urls": ["https://1.1.1.1/cdn-cgi/trace", "https://api.ipify.org"]
+    "urls": [
+      "https://1.1.1.1/cdn-cgi/trace",
+      "https://api.ipify.org"
+    ],
+    "username": "bridge-probe"
   },
   "thresholds": {
     "fail_n": 3,
@@ -33,7 +35,11 @@
       "min_pool": 1
     },
     "hosts": {
-      "match_address": "bridge.example.com"
+      "match_addresses": [
+        "bridge.example.com",
+        "203.0.113.10",
+        "203.0.113.20"
+      ]
     }
   },
   "telegram": {
@@ -45,5 +51,10 @@
     "xray": "/opt/bridge-guard/xray",
     "state": "/var/lib/bridge-guard/state.json",
     "backups": "/var/lib/bridge-guard/backups"
+  },
+  "heartbeat": {
+    "url": "",
+    "daily_summary": true,
+    "summary_hour": 9
   }
 }
