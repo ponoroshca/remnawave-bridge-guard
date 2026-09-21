@@ -228,6 +228,7 @@ $ lanes-probe --bridge RF-1
 - [DNS и Cloudflare](docs/dns.md)
 - [exit-probe](docs/exit-probe.md) · [lanes-probe](docs/lanes-probe.md)
 - [Вопросы и неполадки](docs/faq.md)
+- [Справочник: все команды, флаги, файлы, коды выхода](docs/reference.md)
 - [Пошагово с нуля](docs/START-HERE.md) · [Безопасность и откат](docs/SAFETY.md)
 
 ## Лицензия
