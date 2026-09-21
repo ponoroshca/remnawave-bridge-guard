@@ -8,3 +8,5 @@ Type=oneshot
 ExecStart=/usr/bin/python3 /opt/bridge-guard/bridge_guard.py --config /etc/bridge-guard/config.json
 # 1 = есть мёртвые мосты (это штатно, не сбой сервиса)
 SuccessExitStatus=0 1
+# прогон не может висеть: пробы с таймаутами, но на всякий случай — жёсткий предел
+TimeoutStartSec=150

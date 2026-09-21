@@ -9,7 +9,12 @@
 #   зафиксировать Xray:     XRAY_VERSION=v25.9.11 sudo ./scripts/install.sh
 #
 # Кладёт скрипты в /opt/bridge-guard, скачивает Xray-core с проверкой контрольной суммы, ставит
-# systemd-юниты. Конфиг НЕ пишет и таймер НЕ включает — это делает мастер: bridge-guard setup.
+# systemd-юниты и, если запущен в терминале, сразу открывает мастер (bridge-guard setup).
+#   NO_SETUP=1 — только установить, мастер не запускать.
+#
+# Что НЕ трогает: ваши панель, ноды, боты, nginx, docker, другие службы. Пишет только в
+# /opt/bridge-guard, /etc/bridge-guard, /var/lib/bridge-guard, /usr/local/bin/{bridge-guard,…}
+# и два юнита bridge-guard.service/.timer. Если что-то из этого уже занято чужим — останавливается.
 set -euo pipefail
 
 OPT=/opt/bridge-guard
@@ -20,6 +25,28 @@ SRC_URL="${BRIDGE_GUARD_SRC_URL:-https://github.com/ponoroshca/remnawave-bridge-
 
 [ "$(id -u)" = 0 ] || { echo "нужен root (sudo)"; exit 1; }
 command -v python3 >/dev/null || { echo "нужен python3"; exit 1; }
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' || { echo "нужен Python 3.9+"; exit 1; }
+
+# ── проверка, что не затираем чужое ─────────────────────────────────────────────
+for u in bridge-guard.service bridge-guard.timer; do
+  f="/etc/systemd/system/$u"
+  if [ -f "$f" ] && ! grep -q "/opt/bridge-guard/" "$f" && ! grep -q "bridge-guard —" "$f"; then
+    echo "СТОП: $f уже существует и это не наш юнит (другая программа с тем же именем)."
+    echo "      Переименуйте её или удалите юнит, затем запустите установку снова. Ничего не изменено."
+    exit 1
+  fi
+done
+for b in bridge-guard lanes-probe exit-probe-conf install-exit-probe refresh-exit-probes; do
+  f="/usr/local/bin/$b"
+  if [ -e "$f" ] && [ ! -L "$f" ]; then
+    echo "СТОП: $f уже существует и это не наша ссылка. Переименуйте его. Ничего не изменено."
+    exit 1
+  fi
+  if [ -L "$f" ] && [[ "$(readlink -f "$f")" != /opt/bridge-guard/* ]]; then
+    echo "СТОП: $f ведёт в $(readlink -f "$f") — чужая программа. Ничего не изменено."
+    exit 1
+  fi
+done
 for t in curl unzip tar; do
   command -v "$t" >/dev/null || { apt-get update -qq && apt-get install -y -qq "$t"; }
 done
@@ -80,5 +107,11 @@ fi
 install -m 644 "$SRC/systemd/bridge-guard.service" "$SRC/systemd/bridge-guard.timer" /etc/systemd/system/
 systemctl daemon-reload 2>/dev/null || echo "systemd недоступен (контейнер?) — юниты скопированы, включите таймер на настоящем сервере"
 echo
-echo "Дальше одна команда — мастер всё найдёт сам и проверит:"
-echo "  bridge-guard setup"
+if [ "${NO_SETUP:-0}" != 1 ] && [ -t 1 ] && [ -r /dev/tty ]; then
+  echo "Запускаю мастер настройки (Ctrl+C — прервать; позже: bridge-guard setup)…"
+  echo
+  bridge-guard setup </dev/tty || true
+else
+  echo "Дальше одна команда — мастер всё найдёт сам и проверит:"
+  echo "  bridge-guard setup"
+fi

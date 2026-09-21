@@ -32,7 +32,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 COMMANDS = ("run", "setup", "doctor", "status", "rollback", "bridges")
 
 DEFAULT_THRESHOLDS = {"fail_n": 3, "ok_n": 3, "max_dead": 1}
@@ -223,6 +223,14 @@ class Panel:
     def delete_user(self, uuid):
         return self.call("DELETE", "/api/users/" + uuid)
 
+    def create_host(self, profile_uuid, inbound_uuid, remark, address, port):
+        return self.call("POST", "/api/hosts", {
+            "inbound": {"configProfileUuid": profile_uuid, "configProfileInboundUuid": inbound_uuid},
+            "remark": remark, "address": address, "port": int(port), "isDisabled": False})
+
+    def delete_host(self, uuid):
+        return self.call("DELETE", "/api/hosts/" + uuid)
+
     def set_user_squads(self, uuid, squad_uuids):
         return self.call("PATCH", "/api/users", {"uuid": uuid, "activeInternalSquads": sorted(set(squad_uuids))})
 
@@ -386,6 +394,60 @@ def dns_client(cfg):
     return Cloudflare(d["token_file"], d["zone"], d["name"], d.get("ttl", 60))
 
 
+def telegram_api(tg, method, params=None, timeout=25):
+    """Вызов Bot API с тем же порядком «через прокси → напрямую». Возвращает (json или None, ошибка)."""
+    data = urllib.parse.urlencode(params or {}).encode() if params else None
+    proxy = tg.get("proxy") or None
+    last = None
+    for p in ([proxy, None] if proxy else [None, None]):
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({"https": p} if p else {}))
+            raw = opener.open(urllib.request.Request(f"https://api.telegram.org/bot{tg['bot_token']}/{method}", data=data),
+                              timeout=timeout).read()
+            return json.loads(raw.decode()), None
+        except urllib.error.HTTPError as e:
+            try:
+                body = json.loads(e.read().decode())
+            except Exception:  # noqa: BLE001
+                body = {}
+            return None, f"{e.code} {body.get('description') or e.reason}"
+        except Exception as e:  # noqa: BLE001
+            last = e
+    return None, str(last)[:100]
+
+
+def telegram_detect_chat(tg, wait_s=90):
+    """Кто получает тревоги: просим написать боту /start и берём chat_id из getUpdates.
+    Возвращает (chat_id, подпись) или (None, причина)."""
+    me, err = telegram_api(tg, "getMe")
+    if not me:
+        return None, f"токен не принят Telegram ({err}) — проверьте, что скопировали его целиком у @BotFather"
+    username = me["result"].get("username")
+    print(f"  бот найден: @{username}. Откройте https://t.me/{username} и нажмите Start (или напишите ему что угодно).")
+    print(f"  жду сообщение до {wait_s} с…")
+    t0 = time.time()
+    offset = None
+    while time.time() - t0 < wait_s:
+        params = {"timeout": 15, "allowed_updates": json.dumps(["message"])}
+        if offset:
+            params["offset"] = offset
+        upd, err = telegram_api(tg, "getUpdates", params, timeout=30)
+        if not upd:
+            if err and err.startswith("409"):
+                return None, ("этот бот уже используется другой программой (getUpdates занят или включён webhook). "
+                              "Для тревог заведите ОТДЕЛЬНОГО бота у @BotFather — это минута — или введите chat_id руками")
+            time.sleep(2)
+            continue
+        for u in upd.get("result", []):
+            offset = u["update_id"] + 1
+            msg = u.get("message") or {}
+            chat = msg.get("chat") or {}
+            if chat.get("id"):
+                who = chat.get("title") or " ".join(x for x in (chat.get("first_name"), chat.get("last_name")) if x) or chat.get("username") or "?"
+                return chat["id"], who
+    return None, "за отведённое время сообщение не пришло"
+
+
 def telegram_send(tg, text, quiet=False, prefix="🌉 Сторож мостов\n"):
     """Сообщение админу. Если задан proxy — сначала через него (на российских серверах
     api.telegram.org часто недоступен напрямую), потом напрямую; несколько попыток."""
@@ -475,12 +537,30 @@ def probe_bridge(cfg, bridge, local_port):
         os.unlink(tmp.name)
 
 
+def free_ports(start, count):
+    """count свободных локальных портов начиная со start — чтобы не столкнуться с чужой службой."""
+    out, port = [], start
+    while len(out) < count and port < 65000:
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", port))
+            out.append(port)
+        except OSError:
+            pass
+        finally:
+            s.close()
+        port += 1
+    return out
+
+
 def probe_all(cfg, bridges, fake_dead=()):
+    ports = free_ports(cfg["probe"]["port_base"], len(bridges))
+
     def one(i_b):
         i, b = i_b
         if b["name"] in fake_dead:
             return b["name"], False
-        return b["name"], probe_bridge(cfg, b, cfg["probe"]["port_base"] + i)
+        return b["name"], probe_bridge(cfg, b, ports[i])
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(bridges)))) as ex:
         return dict(ex.map(one, enumerate(bridges)))
 
@@ -603,7 +683,7 @@ def heartbeat(cfg, state, quiet):
         state["stats"] = {"runs": 0, "events": 0, "since": time.time()}
 
 
-def cmd_run(cfg, dry=False, quiet=False, fake_dead=()):
+def cmd_run(cfg, dry=False, quiet=False, fake_dead=(), notify_prefix="🌉 Сторож мостов\n"):
     th = cfg["thresholds"]
     panel = Panel(cfg["panel"]["url"], cfg["panel"]["token"]) if cfg["panel"].get("url") and cfg["panel"].get("token") else None
     try:
@@ -695,7 +775,7 @@ def cmd_run(cfg, dry=False, quiet=False, fake_dead=()):
         lines = [ln for ln in lines if ln]
         print("\n".join("  " + ln for ln in lines))
         remember(state, lines[0])
-        telegram_send(cfg["telegram"], "\n".join(lines), quiet)
+        telegram_send(cfg["telegram"], "\n".join(lines), quiet, prefix=notify_prefix)
 
     if not dry:
         heartbeat(cfg, state, quiet)
@@ -938,17 +1018,39 @@ def cmd_setup(a):
 
     # 1. панель
     print("── 1/6 Панель Remnawave ──")
+    print("  Где взять: адрес — тот, по которому вы открываете панель в браузере.")
+    print("  API-токен: в панели → API Tokens → Create → имя bridge-guard → скопировать (показывается один раз).")
     url = a.panel_url or ask("адрес панели (https://panel.example.com)", cfg["panel"].get("url"), yes=yes)
+    if not url.startswith("http"):
+        url = "https://" + url
     token = a.token or ask("API-токен панели", cfg["panel"].get("token"), secret=True, yes=yes)
     panel = Panel(url, token)
     try:
         profs = panel.profiles()
         nodes = panel.nodes()
+    except urllib.error.HTTPError as e:
+        print(f"  ❌ панель ответила {e.code}: " + ("токен не принят — проверьте, что скопировали его целиком" if e.code in (401, 403) else str(e.reason)[:80]))
+        return 2
     except Exception as e:  # noqa: BLE001
-        print("  ❌ панель не ответила:", str(e)[:120])
+        print("  ❌ панель не ответила:", str(e)[:120], "— проверьте адрес (с https://) и что панель доступна с этого сервера")
         return 2
     print(f"  ✅ панель отвечает, профилей {len(profs)}, нод {len(nodes)}")
     cfg["panel"].update({"url": url.rstrip("/"), "token": token})
+
+    # где стоит сторож: не на панели и не на мосту
+    my_ip = ""
+    try:
+        my_ip = urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode().strip()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        panel_ip = socket.gethostbyname(urllib.parse.urlparse(url).hostname or "")
+    except Exception:  # noqa: BLE001
+        panel_ip = ""
+    if my_ip and panel_ip and my_ip == panel_ip:
+        print("  ⚠️ этот сервер — сама панель. Сторож должен стоять в стране клиентов: проверка отсюда покажет не то, что видят они.")
+        if not ask_yes("всё равно продолжить", False, yes):
+            return 2
 
     # 2. мосты — ноды панели (обычно те, что в стране клиентов)
     print("\n── 2/6 Мосты ──")
@@ -983,6 +1085,9 @@ def cmd_setup(a):
     if not chosen:
         print("  ❌ мосты не выбраны")
         return 2
+    if my_ip and any(r["ip"] == my_ip for r in chosen):
+        print(f"  ⚠️ этот сервер ({my_ip}) — один из мостов. Сторож проверит остальные мосты, а собственный отказ сети не заметит;"
+              " лучше отдельный маленький сервер.")
     # как запомнить выбор: «все ноды этих профилей» (точнее всего — мосты обычно делят один профиль),
     # иначе «все ноды этих стран», иначе явный список
     sel_profiles = {r["prof"]["name"] for r in chosen}
@@ -1045,7 +1150,8 @@ def cmd_setup(a):
 
     # 4. служебный пользователь — в сквадах ВСЕХ нужных инбаундов
     print("\n── 4/6 Служебный пользователь ──")
-    username = a.probe_user or ask("имя служебного пользователя", cfg["probe"].get("username") or "bridge-probe", yes=yes)
+    print("  Проба ходит через мост как обычный клиент — для этого в панели нужен отдельный пользователь без лимита.")
+    username = a.probe_user or ask("имя служебного пользователя (Enter — оставить)", cfg["probe"].get("username") or "bridge-probe", yes=yes)
     squads = panel.squads()
     need_squads = {}
     for ib_uuid, (pname, tag) in need_inbounds.items():
@@ -1091,14 +1197,20 @@ def cmd_setup(a):
             if resolved & bridge_ips:
                 pool_names.append(adr)
     dns_cfg = cfg["failover"].get("dns") or {}
+    print("  Два способа увести клиентов с мёртвого моста (можно оба):")
+    print("   • DNS-пул — одно имя (например bridge.ваш-домен) с A-записью на каждый мост; сторож убирает мёртвый из DNS. Нужен домен на Cloudflare.")
+    print("   • хосты подписки — сторож переписывает адрес хоста на живой мост; клиенты получат его при обновлении подписки.")
     if pool_names:
         print("  DNS-пул найден: " + ", ".join(pool_names) + " (имя из хостов подписки резолвится в IP мостов)")
-    name = a.dns_name or ask("имя DNS-пула (пусто — без DNS, только хосты)", dns_cfg.get("name") or (pool_names[0] if pool_names else ""), yes=yes)
+    name = a.dns_name if a.dns_name is not None else ask("имя DNS-пула на Cloudflare (Enter — пропустить, будут только хосты)",
+                                                          dns_cfg.get("name") or (pool_names[0] if pool_names else ""), yes=yes)
     if name:
-        zone = ask("зона в Cloudflare", dns_cfg.get("zone") or registrable_zone(name), yes=yes)
+        zone = ask("зона (домен) в Cloudflare", dns_cfg.get("zone") or registrable_zone(name), yes=yes)
         token_file = a.dns_token_file or dns_cfg.get("token_file") or "/etc/bridge-guard/cloudflare.token"
         if not os.path.exists(token_file):
-            tok = ask("токен Cloudflare (Edit zone DNS на эту зону)", None, secret=True, yes=False)
+            print("  Где взять: dash.cloudflare.com → My Profile → API Tokens → Create Token → шаблон «Edit zone DNS» →")
+            print(f"  Zone Resources: Include → Specific zone → {zone} → Continue → Create Token → скопировать.")
+            tok = ask("токен Cloudflare", None, secret=True, yes=False)
             os.makedirs(os.path.dirname(token_file), exist_ok=True)
             with open(token_file, "w") as f:
                 f.write(tok.strip() + "\n")
@@ -1107,9 +1219,29 @@ def cmd_setup(a):
             cf = Cloudflare(token_file, zone, name, dns_cfg.get("ttl", 60))
             pool = {r["content"] for r in cf.records()}
             print(f"  ✅ Cloudflare видит зону; в пуле {name}: {', '.join(sorted(pool)) or 'пусто'}")
-            for b in bridges:
-                if b["ip"] not in pool:
-                    print(f"     ⚠️ {b['name']} {b['ip']} нет в пуле — добавьте A-запись, если мост рабочий")
+            missing = [b for b in bridges if b["ip"] not in pool]
+            if missing:
+                create = a.dns_create if a.dns_create is not None else ask_yes(
+                    f"создать A-записи {name} → {', '.join(b['ip'] for b in missing)} (TTL 60, без прокси)", not pool, yes)
+                if create:
+                    for b in missing:
+                        cf.add(b["ip"])
+                        print(f"     ✅ A {name} → {b['ip']} создана")
+                else:
+                    for b in missing:
+                        print(f"     ⚠️ {b['name']} {b['ip']} нет в пуле — сторож его не увидит в DNS, пока запись не появится")
+            # хост подписки на имя пула — без него клиенты пул не получат
+            if not any(h.get("address") == name and not h.get("isDisabled") for h in hosts):
+                first = chosen[0]
+                pr0 = derived[first["name"]]
+                print(f"  в панели нет хоста подписки с адресом {name} — без него клиенты не узнают о пуле")
+                if a.create_host or ask_yes(f"создать хост «Авто (пул мостов)» → {name}:{pr0['port']} на инбаунде {first['prof']['name']}:{pr0['inbound_tag']}", False, yes):
+                    try:
+                        panel.create_host(first["prof"]["uuid"], pr0["inbound_uuid"], "Авто (пул мостов)", name, pr0["port"])
+                        print("     ✅ хост создан; sni/отпечаток при необходимости поправьте в панели")
+                        hosts = panel.hosts()
+                    except Exception as e:  # noqa: BLE001
+                        print("     ❌ хост не создан:", str(e)[:120], "— создайте в панели руками")
         except Exception as e:  # noqa: BLE001
             print("  ❌ Cloudflare:", str(e)[:120], "— DNS-режим не включаю")
             name = ""
@@ -1130,14 +1262,28 @@ def cmd_setup(a):
     # 6. Telegram
     print("\n── 6/6 Telegram ──")
     tg = cfg["telegram"]
-    tg["bot_token"] = a.tg_token or ask("токен бота (пусто — без Telegram)", tg.get("bot_token", ""), secret=True, yes=yes)
+    print("  Тревоги приходят в Telegram. Нужен ОТДЕЛЬНЫЙ бот: в Telegram откройте @BotFather → /newbot →")
+    print("  придумайте имя и username (оканчивается на bot) → скопируйте токен вида 123456789:AAF…")
+    tg["bot_token"] = a.tg_token if a.tg_token is not None else ask("токен бота (Enter — без Telegram)", tg.get("bot_token", ""), secret=True, yes=yes)
     if tg["bot_token"]:
-        tg["chat_id"] = int(a.tg_chat or ask("chat_id получателя", tg.get("chat_id"), yes=yes))
         tg["proxy"] = a.tg_proxy if a.tg_proxy is not None else (tg.get("proxy") or "")
+        chat = a.tg_chat or (tg.get("chat_id") if yes else None)
+        if not chat:
+            if tg.get("chat_id") and ask_yes(f"оставить получателя chat_id {tg['chat_id']}", True, yes):
+                chat = tg["chat_id"]
+            else:
+                chat, who = telegram_detect_chat(tg)
+                if chat:
+                    print(f"  ✅ получатель: {who} (chat_id {chat})")
+                else:
+                    print(f"  ❌ {who}")
+                    chat = ask("chat_id получателя (узнать: напишите @userinfobot)", tg.get("chat_id"), yes=False)
+        tg["chat_id"] = int(chat)
         if not a.skip_telegram_test:
             if not telegram_send(tg, "✅ Тестовое сообщение мастера настройки — доставка работает.", False):
                 if not tg["proxy"] and not yes:
-                    tg["proxy"] = ask("не доставилось. HTTP-прокси для api.telegram.org (пусто — оставить как есть)", "", yes=yes)
+                    print("  На серверах в РФ api.telegram.org часто недоступен напрямую — нужен HTTP-прокси (например, ваш же VPN-выход).")
+                    tg["proxy"] = ask("HTTP-прокси для api.telegram.org, вида http://127.0.0.1:3128 (Enter — оставить как есть)", "", yes=yes)
                     if tg["proxy"]:
                         telegram_send(tg, "✅ Тестовое сообщение мастера настройки — доставка через прокси работает.", False)
     cfg["telegram"] = tg
@@ -1155,7 +1301,12 @@ def cmd_setup(a):
         print("  ❌ ни один мост не прошёл пробу — bridge-guard doctor подскажет причину")
         return 1
     print("\n── Репетиция отказа (ничего не меняется) ──")
-    cmd_run(cfg, dry=True, quiet=True, fake_dead={bridges[0]["name"]})
+    live = [b["name"] for b in bridges if results.get(b["name"])]
+    victim = live[0] if live else bridges[0]["name"]
+    send_test = bool(cfg["telegram"].get("bot_token")) and not a.skip_telegram_test and \
+        ask_yes("прислать эту репетицию в Telegram как тестовую тревогу (так будет выглядеть настоящая)", True, yes)
+    cmd_run(cfg, dry=True, quiet=not send_test, fake_dead={victim},
+            notify_prefix="🧪 ТЕСТ — репетиция отказа, ничего не переключалось\n")
 
     if shutil.which("systemctl") and not a.no_enable and ask_yes("включить таймер (проверка раз в минуту)", True, yes):
         r = subprocess.run(["systemctl", "enable", "--now", "bridge-guard.timer"], capture_output=True, text=True)
@@ -1189,8 +1340,11 @@ def main():
     s.add_argument("--port", type=int, help="порт инбаунда, которым пользуются клиенты")
     s.add_argument("--probe-user")
     s.add_argument("--no-user-create", action="store_true")
-    s.add_argument("--dns-name")
+    s.add_argument("--dns-name", help="имя DNS-пула; пустая строка — без DNS")
     s.add_argument("--dns-token-file")
+    s.add_argument("--dns-create", dest="dns_create", action="store_true", default=None, help="создать недостающие A-записи мостов")
+    s.add_argument("--no-dns-create", dest="dns_create", action="store_false", help="не создавать A-записи")
+    s.add_argument("--create-host", action="store_true", help="создать хост подписки на имя пула, если его нет")
     s.add_argument("--no-hosts", action="store_true")
     s.add_argument("--tg-token")
     s.add_argument("--tg-chat")
