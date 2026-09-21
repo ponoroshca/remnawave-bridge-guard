@@ -17,6 +17,7 @@ import os
 import sys
 import urllib.request
 
+VERSION = "1.3.1"
 DEFAULT_CONTROLS = [["Cloudflare", "104.16.123.96", 443], ["ya.ru", "77.88.55.242", 443]]
 
 
@@ -36,6 +37,7 @@ def main():
     ap.add_argument("--timeout", type=float, default=5)
     ap.add_argument("--attempts", type=int, default=3)
     ap.add_argument("--repeat-hours", type=float, default=6)
+    ap.add_argument("--version", action="version", version=VERSION)
     a = ap.parse_args()
 
     with open(a.config, encoding="utf-8") as f:

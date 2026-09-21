@@ -27,7 +27,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bridge_guard import Panel, build_outbound, inbound_client_params, is_ip, read_config  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.3.1"
 
 
 def fetch(proxy, url, timeout, max_seconds=None, max_bytes=None):

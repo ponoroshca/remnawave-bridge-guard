@@ -32,7 +32,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 COMMANDS = ("run", "setup", "doctor", "status", "rollback", "bridges")
 
 DEFAULT_THRESHOLDS = {"fail_n": 3, "ok_n": 3, "max_dead": 1}
@@ -637,11 +637,13 @@ def hosts_restore(cfg, panel, state, dry):
     return f"хостов возвращено на исходные адреса: {len(todo)}"
 
 
-def dns_change(cfg, dns, ip, present, dry):
-    """present=False — убрать A-запись мёртвого моста, True — вернуть. Бережём min_pool."""
+def dns_change(cfg, dns, ip, present, dry, state=None):
+    """present=False — убрать A-запись мёртвого моста, True — вернуть. Бережём min_pool.
+    Что убрал сторож — помнит в state['dns_removed'] и возвращает только это."""
     if not dns:
         return None
     d = cfg["failover"]["dns"]
+    removed = (state or {}).setdefault("dns_removed", []) if state is not None else []
     try:
         pool = {r["content"] for r in dns.records()}
         if not present:
@@ -652,12 +654,20 @@ def dns_change(cfg, dns, ip, present, dry):
             if dry:
                 return f"[dry-run] DNS: убрал бы A {d['name']} → {ip}"
             dns.remove(ip)
+            if ip not in removed:
+                removed.append(ip)
             return f"DNS: A {d['name']} → {ip} убрана"
         if ip in pool:
+            if ip in removed:
+                removed.remove(ip)
             return f"DNS: {ip} уже в {d['name']}"
+        if state is not None and ip not in removed:
+            return f"DNS: {ip} не было в {d['name']} и до отказа — не добавляю (добавьте руками, если мост должен быть в пуле)"
         if dry:
             return f"[dry-run] DNS: вернул бы A {d['name']} → {ip}"
         dns.add(ip)
+        if ip in removed:
+            removed.remove(ip)
         return f"DNS: A {d['name']} → {ip} возвращена"
     except Exception as e:  # noqa: BLE001
         return f"DNS: ошибка — {str(e)[:120]}"
@@ -686,16 +696,21 @@ def heartbeat(cfg, state, quiet):
 def cmd_run(cfg, dry=False, quiet=False, fake_dead=(), notify_prefix="🌉 Сторож мостов\n"):
     th = cfg["thresholds"]
     panel = Panel(cfg["panel"]["url"], cfg["panel"]["token"]) if cfg["panel"].get("url") and cfg["panel"].get("token") else None
+    state = load_state(cfg["paths"]["state"])
     try:
         bridges = bridges_of(cfg, panel)
+        state["bridges_cache"] = bridges
     except Exception as e:  # noqa: BLE001
-        print("мосты не определены:", e, file=sys.stderr)
-        return 2
+        cached = state.get("bridges_cache") or []
+        if not cached:
+            print("мосты не определены:", e, file=sys.stderr)
+            return 2
+        print(f"  панель недоступна ({str(e)[:80]}) — проверяю мосты по списку прошлого прогона")
+        bridges = cached
     unknown = set(fake_dead) - {b["name"] for b in bridges}
     if unknown:
         print(f"--fake-dead: нет таких мостов: {', '.join(sorted(unknown))}", file=sys.stderr)
         return 2
-    state = load_state(cfg["paths"]["state"])
     st = state["bridges"]
     names = [b["name"] for b in bridges]
     ip_of = {b["name"]: b["ip"] for b in bridges}
@@ -759,7 +774,7 @@ def cmd_run(cfg, dry=False, quiet=False, fake_dead=(), notify_prefix="🌉 Ст�
         if ev == "died":
             lines = [f"🔴 {name} ({ip}) не проходит проверку {th['fail_n']} раз подряд — клиент через него не выходит в сеть."]
             if alive:
-                lines.append(dns_change(cfg, dns, ip, False, dry))
+                lines.append(dns_change(cfg, dns, ip, False, dry, state))
                 if hosts_mode:
                     lines.append(hosts_switch(cfg, panel, state, dead_ips, alive_ips[0], dry))
                 lines.append(f"Живые мосты: {', '.join(f'{n} ({ip_of[n]})' for n in alive)}. "
@@ -768,7 +783,7 @@ def cmd_run(cfg, dry=False, quiet=False, fake_dead=(), notify_prefix="🌉 Ст�
                 lines.append("🔴🔴 ЖИВЫХ МОСТОВ НЕТ. Переключать некуда — нужен живой мост.")
         else:
             lines = [f"🟢 {name} ({ip}) снова проходит проверку {th['ok_n']} раз подряд."]
-            lines.append(dns_change(cfg, dns, ip, True, dry))
+            lines.append(dns_change(cfg, dns, ip, True, dry, state))
             if hosts_mode and state.get("switched"):
                 lines.append(hosts_restore(cfg, panel, state, dry) if not dead
                              else f"хосты остаются на {state['switched']['to']} — ещё есть мёртвые мосты: {', '.join(dead)}")
@@ -814,7 +829,7 @@ def cmd_status(cfg):
 def cmd_rollback(cfg, dry, yes):
     state = load_state(cfg["paths"]["state"])
     bridges = bridges_of(cfg)
-    print("Откат: вернуть хосты на исходные адреса, вернуть A-записи всех мостов, сбросить состояние.")
+    print("Откат: вернуть хосты на исходные адреса, вернуть A-записи, которые убирал сторож, сбросить состояние.")
     if not dry and not yes and input("Продолжить? [y/N] ").strip().lower() not in ("y", "yes", "д", "да"):
         print("отменено")
         return 0
@@ -825,7 +840,7 @@ def cmd_rollback(cfg, dry, yes):
         print("  хосты: переведённых нет")
     dns = dns_client(cfg) if cfg["failover"].get("dns") else None
     for b in bridges:
-        line = dns_change(cfg, dns, b["ip"], True, dry)
+        line = dns_change(cfg, dns, b["ip"], True, dry, state)
         if line:
             print("  " + line)
     if not dry:
@@ -1268,7 +1283,10 @@ def cmd_setup(a):
     if tg["bot_token"]:
         tg["proxy"] = a.tg_proxy if a.tg_proxy is not None else (tg.get("proxy") or "")
         chat = a.tg_chat or (tg.get("chat_id") if yes else None)
-        if not chat:
+        if not chat and yes:
+            print("  ⚠️ --yes без --tg-chat: получатель неизвестен, Telegram отключаю (задайте --tg-chat или запустите без --yes)")
+            tg["bot_token"] = ""
+        if not chat and tg["bot_token"]:
             if tg.get("chat_id") and ask_yes(f"оставить получателя chat_id {tg['chat_id']}", True, yes):
                 chat = tg["chat_id"]
             else:
@@ -1278,8 +1296,14 @@ def cmd_setup(a):
                 else:
                     print(f"  ❌ {who}")
                     chat = ask("chat_id получателя (узнать: напишите @userinfobot)", tg.get("chat_id"), yes=False)
-        tg["chat_id"] = int(chat)
-        if not a.skip_telegram_test:
+        if not tg["bot_token"]:
+            chat = None
+        try:
+            tg["chat_id"] = int(chat) if chat else None
+        except (TypeError, ValueError):
+            print(f"  ❌ chat_id должен быть числом, получено: {chat!r} — Telegram отключаю")
+            tg["bot_token"], tg["chat_id"] = "", None
+        if tg["bot_token"] and tg["chat_id"] and not a.skip_telegram_test:
             if not telegram_send(tg, "✅ Тестовое сообщение мастера настройки — доставка работает.", False):
                 if not tg["proxy"] and not yes:
                     print("  На серверах в РФ api.telegram.org часто недоступен напрямую — нужен HTTP-прокси (например, ваш же VPN-выход).")
@@ -1303,7 +1327,7 @@ def cmd_setup(a):
     print("\n── Репетиция отказа (ничего не меняется) ──")
     live = [b["name"] for b in bridges if results.get(b["name"])]
     victim = live[0] if live else bridges[0]["name"]
-    send_test = bool(cfg["telegram"].get("bot_token")) and not a.skip_telegram_test and \
+    send_test = bool(cfg["telegram"].get("bot_token") and cfg["telegram"].get("chat_id")) and not a.skip_telegram_test and \
         ask_yes("прислать эту репетицию в Telegram как тестовую тревогу (так будет выглядеть настоящая)", True, yes)
     cmd_run(cfg, dry=True, quiet=not send_test, fake_dead={victim},
             notify_prefix="🧪 ТЕСТ — репетиция отказа, ничего не переключалось\n")
@@ -1361,7 +1385,7 @@ def main():
     sub.add_parser("bridges", help="список мостов (имя и IP) — для скриптов", parents=[common])
 
     argv = sys.argv[1:]
-    if not any(x in COMMANDS for x in argv):
+    if not any(x in COMMANDS for x in argv) and not any(x in ("--version", "-h", "--help") for x in argv):
         argv = ["run"] + argv          # bridge-guard --dry-run  ==  bridge-guard run --dry-run
     a = ap.parse_args(argv)
     if a.cmd == "setup":
@@ -1386,4 +1410,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nпрервано")
+        sys.exit(130)

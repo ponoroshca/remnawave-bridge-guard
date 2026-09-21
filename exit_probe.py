@@ -32,7 +32,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.3.1"
 DEFAULT_CONTROLS = [["Cloudflare", "104.16.123.96", 443], ["ya.ru", "77.88.55.242", 443]]
 
 

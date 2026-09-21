@@ -5,14 +5,16 @@
 IP выхода, отклик (`https://1.1.1.1/cdn-cgi/trace`) и скорость скачивания.
 
 ```bash
-lanes-probe --profile "RF-Bridge" --bridge 203.0.113.10
-lanes-probe --profile "RF-Bridge" --bridge 203.0.113.10 --no-speed
-lanes-probe --profile "RF-Bridge" --bridge 203.0.113.10 --speed-url https://example.com/100MB.bin --speed-seconds 8
+lanes-probe --bridge RF-1                 # мост по имени из панели
+lanes-probe --bridge 203.0.113.10         # или по IP
+lanes-probe --bridge RF-1 --no-speed      # без замера скорости (быстрее)
+lanes-probe --bridge RF-1 --speed-url https://example.com/100MB.bin --speed-seconds 8
 ```
 
 Что нужно: `panel.url`, `panel.token`, `probe.uuid` из конфига сторожа и бинарник xray
-(`paths.xray`). Публичные ключи Reality считаются из приватных ключей профиля
-(`xray x25519 -i`). Названия режимов берутся из хостов подписки по порту.
+(`paths.xray`). Профиль берётся у ноды в панели; для каждого инбаунда клиент собирается
+так же, как в ссылке подписки (Reality/TLS, TCP/WebSocket/gRPC/xHTTP); названия режимов —
+из хостов подписки этого инбаунда.
 
 Служебный пользователь должен состоять в сквадах **всех** проверяемых инбаундов —
 иначе режим покажет «нет выхода», хотя у клиентов он работает.
